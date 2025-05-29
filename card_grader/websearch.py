@@ -1,98 +1,74 @@
 import os
-import re
-import csv
-import time
 import requests
 from bs4 import BeautifulSoup
+import pandas as pd
 from urllib.parse import quote
-from urllib.request import urlretrieve
-import subprocess
+from PIL import Image
+from io import BytesIO
 
-SAVE_DIR = "card_grader/image_process/images"
-CSV_FILE = "card_grader/image_process/metadata.csv"
-PREPROCESS_PATH = "card_grader/image_process/preprocess.py"
+# === CONFIGURATION ===
+OUTPUT_DIR = "card_grader/image_process/images"
+METADATA_PATH = "card_grader/image_process/metadata.csv"
+NUM_PAGES = 2  # Number of pages per grade to scrape
 
-os.makedirs(SAVE_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-def scrape_ebay_cards(search_term="psa pokemon card", max_pages=3):
-    results = []
-    base_url = "https://www.ebay.com/sch/i.html?_nkw={}&_sop=12&_pgn={}"
+def fetch_image_urls(grade, num_pages=1):
+    base_url = "https://www.ebay.com/sch/i.html?_nkw={query}&_sop=12&_pgn={page}"
+    image_urls = []
+    listings = []
 
-    for page in range(1, max_pages + 1):
-        url = base_url.format(quote(search_term), page)
-        print(f"\n📄 Scraping page {page}: {url}")
+    for page in range(1, num_pages + 1):
+        query = quote(f"psa {grade} pokemon card")
+        url = base_url.format(query=query, page=page)
+        print(f"📄 Scraping grade {grade} - page {page}: {url}")
+
         try:
-            response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            response = requests.get(url, timeout=10)
             soup = BeautifulSoup(response.text, "html.parser")
             items = soup.select("li.s-item")
+
+            for item in items:
+                img_tag = item.select_one("img")
+                title_tag = item.select_one(".s-item__title")
+                link_tag = item.select_one("a.s-item__link")
+
+                if not img_tag or not img_tag.get("src"):
+                    continue
+
+                image_url = img_tag["src"]
+                title = title_tag.text if title_tag else ""
+                url = link_tag["href"] if link_tag else ""
+
+                listings.append({"image_url": image_url, "title": title, "grade": grade, "url": url})
         except Exception as e:
-            print(f"❌ Failed to fetch or parse page {page}: {e}")
-            continue
+            print(f"❌ Failed to scrape page {page} for grade {grade}: {e}")
 
-        found = False
+    return listings
 
-        for item in items:
-            title_tag = item.select_one(".s-item__title")
-            link_tag = item.select_one("a.s-item__link")
-            img_tag = item.select_one("img")
+def download_images_and_save_metadata(all_listings):
+    metadata = []
+    for i, listing in enumerate(all_listings):
+        try:
+            response = requests.get(listing["image_url"], timeout=10)
+            img = Image.open(BytesIO(response.content)).convert("RGB")
 
-            if not title_tag or not img_tag:
-                continue
+            # Generate safe filename
+            safe_title = "".join(c for c in listing["title"] if c.isalnum() or c in (" ", "_")).rstrip()
+            filename = f"{listing['grade']}_{safe_title[:80].strip().replace(' ', '_')}.jpg"
+            filepath = os.path.join(OUTPUT_DIR, filename)
+            img.save(filepath, "JPEG")
 
-            title = title_tag.get_text(strip=True)
-            link = link_tag.get("href") if link_tag else None
+            metadata.append({"filepath": filepath, "title": listing["title"], "grade": listing["grade"], "url": listing["url"]})
+        except Exception as e:
+            print(f"❌ Failed to download image {listing['image_url']}: {e}")
 
-            # Fallback order for image sources
-            image_url = (
-                img_tag.get("src") or
-                img_tag.get("data-src") or
-                img_tag.get("data-img-src")
-            )
-
-            grade_match = re.search(r'\bpsa\s?(\d{1,2})\b', title, re.IGNORECASE)
-            if not grade_match or not image_url:
-                continue
-
-            grade = int(grade_match.group(1))
-            filename = f"{grade}_" + re.sub(r'[^a-zA-Z0-9]+', '_', title)[:50] + ".jpg"
-            filepath = os.path.join(SAVE_DIR, filename)
-
-            # Attempt to use higher resolution
-            image_url = re.sub(r"s-l\d+\.webp", "s-l1600.webp", image_url)
-            image_url = re.sub(r"s-l\d+\.jpg", "s-l1600.jpg", image_url)
-
-            try:
-                urlretrieve(image_url, filepath)
-                print(f"💾 Saved: {os.path.relpath(filepath)}")
-                results.append((filepath, grade, title, link))
-                found = True
-            except Exception as e:
-                print(f"❌ Failed to save {image_url}: {e}")
-
-        if not found:
-            print("⚠️ No listings found.")
-
-        time.sleep(1)
-
-    return results
-
-def save_metadata(results):
-    with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["filepath", "grade", "title", "url"])
-        writer.writerows(results)
-    print(f"\n✅ Metadata saved to {CSV_FILE}")
-
-def run_preprocess():
-    print("\n🚀 Running preprocess.py...")
-    result = subprocess.run(["python3", PREPROCESS_PATH])
-    if result.returncode != 0:
-        print("❌ Preprocessing failed.")
+    df = pd.DataFrame(metadata)
+    df.to_csv(METADATA_PATH, index=False)
+    print(f"\n✅ Metadata saved to {METADATA_PATH}")
 
 if __name__ == "__main__":
-    data = scrape_ebay_cards()
-    if data:
-        save_metadata(data)
-        run_preprocess()
-    else:
-        print("⚠️ No data scraped.")
+    all_listings = []
+    for grade in range(1, 11):
+        all_listings.extend(fetch_image_urls(grade, NUM_PAGES))
+    download_images_and_save_metadata(all_listings)
